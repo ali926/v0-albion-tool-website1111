@@ -1,0 +1,17 @@
+[
+  {
+    "item_id": "T4_2H_SWORD",
+    "materials": [{ "item_id": "T4_METALBAR", "quantity": 16 }, { "item_id": "T3_METALBAR", "quantity": 8 }],
+    "base_return_rate": 0.152
+  },
+  {
+    "item_id": "T4_LEATHER",
+    "materials": [{ "item_id": "T4_HIDE", "quantity": 2 }],
+    "base_return_rate": 0.152
+  },
+  {
+    "item_id": "T4_METALBAR",
+    "materials": [{ "item_id": "T4_ORE", "quantity": 2 }],
+    "base_return_rate": 0.152
+  }
+]

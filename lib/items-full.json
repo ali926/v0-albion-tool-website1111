@@ -1,0 +1,42 @@
+[
+  {
+    "id": "T4_2H_SWORD",
+    "name": "Adept's Claymore",
+    "tier": 4,
+    "enchantment": 0,
+    "category": "weapon",
+    "craftable": true
+  },
+  {
+    "id": "T4_HIDE",
+    "name": "Adept's Hide",
+    "tier": 4,
+    "enchantment": 0,
+    "category": "resource",
+    "craftable": false
+  },
+  {
+    "id": "T4_LEATHER",
+    "name": "Adept's Leather",
+    "tier": 4,
+    "enchantment": 0,
+    "category": "resource",
+    "craftable": true
+  },
+  {
+    "id": "T4_METALBAR",
+    "name": "Adept's Metal Bar",
+    "tier": 4,
+    "enchantment": 0,
+    "category": "resource",
+    "craftable": true
+  },
+  {
+    "id": "T4_ORE",
+    "name": "Adept's Ore",
+    "tier": 4,
+    "enchantment": 0,
+    "category": "resource",
+    "craftable": false
+  }
+]
