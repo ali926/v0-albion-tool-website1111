@@ -1,426 +1,345 @@
 #!/usr/bin/env node
+
 /**
- * Albion Online Database Builder
+ * build-database.js — Hybrid AO bin dump + AODP
  *
- * Fetches item and recipe data from AO Data Project and generates
- * complete local JSON databases for the Albion Tool.
- *
- * Usage: node scripts/build-database.ts [options]
- * Options:
- *   --force      Ignore cache and fetch fresh data
- *   --verbose    Enable detailed logging
- *   --dry-run    Parse and validate without writing files
- *   --sample N   Generate sample database with N items
+ * Usage: `node ./scripts/build-database.js [--force] [--dry-run] [--verbose] [--sample N]`
  */
 
-import { writeFile, readFile, mkdir, access, copyFile } from "fs/promises"
-import { join, dirname } from "path"
+import fs from "fs/promises";
+import path from "path";
+import { fileURLToPath } from "url";
+import process from "process";
+import { setTimeout as wait } from "timers/promises";
 
-// Configuration
-const AO_DATA_URL = "https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/formatted/items.json"
-const CACHE_PATH = "/tmp/ao-dump-cache.json"
-const OUTPUT_DIR = join(process.cwd(), "lib")
-const ITEMS_OUTPUT = join(OUTPUT_DIR, "items-full.json")
-const RECIPES_OUTPUT = join(OUTPUT_DIR, "recipes-full.json")
-const BACKUP_DIR = join(OUTPUT_DIR, "backups")
+const __dirname = path.dirname(fileURLToPath(import.meta.url));
+const ROOT = path.resolve(__dirname, "..");
+const LIB_DIR = path.join(ROOT, "lib");
+const BACKUPS_DIR = path.join(LIB_DIR, "backups");
 
-// CLI flags
-const args = process.argv.slice(2)
-const FORCE = args.includes("--force")
-const VERBOSE = args.includes("--verbose")
-const DRY_RUN = args.includes("--dry-run")
-const SAMPLE_SIZE = args.includes("--sample") ? Number.parseInt(args[args.indexOf("--sample") + 1] || "100") : null
+const AO_DUMP_URL =
+  "https://raw.githubusercontent.com/ao-data/ao-bin-dumps/master/formatted/items.json";
+const AODP_ITEMS_URL = "https://www.albion-online-data.com/api/v2/items";
 
-// Types for AO Data
-interface AOItem {
-  UniqueName: string
-  LocalizedNames?: { "EN-US"?: string }
-  LocalizationNameVariable?: string
-  LocalizationDescriptionVariable?: string
-  Index?: number
-  Tier?: number
-  enchantmentlevel?: number
-  craftingrequirements?: {
-    craftresource?: Array<{
-      uniquename?: string
-      count?: string | number
-    }>
-    silver?: string | number
-    time?: string | number
-    craftingfocus?: string | number
-    amountcrafted?: string | number
-    returnamountfactor?: string | number
+const CACHE_AO = "/tmp/ao-dump-cache.json";
+const CACHE_AODP = "/tmp/aodp-cache.json";
+
+function log(...args) {
+  if (!global.__BUILD_DB_SILENT) {
+    console.log(...args);
   }
 }
 
-interface ProcessedItem {
-  id: string
-  name: string
-  tier: number
-  enchantment: number
-  category: string
-  craftable: boolean
+function verbose(...args) {
+  if (global.__BUILD_DB_VERBOSE) {
+    console.debug(...args);
+  }
 }
 
-interface ProcessedRecipe {
-  item_id: string
-  materials: Array<{ item_id: string; quantity: number }>
-  base_return_rate: number
-  crafting_station?: string
-  silver_cost?: number
+async function ensureDirs() {
+  await fs.mkdir(LIB_DIR, { recursive: true });
+  await fs.mkdir(BACKUPS_DIR, { recursive: true });
 }
 
-interface BuildStats {
-  totalItems: number
-  craftableItems: number
-  recipesGenerated: number
-  warnings: string[]
-}
-
-// Utility functions
-function log(message: string, level: "info" | "warn" | "error" = "info") {
-  const timestamp = new Date().toISOString()
-  const prefix = level === "error" ? "❌" : level === "warn" ? "⚠️" : "✓"
-  console.log(`[${timestamp}] ${prefix} ${message}`)
-}
-
-function verbose(message: string) {
-  if (VERBOSE) log(message, "info")
-}
-
-// Fetch with retry and caching
-async function fetchWithRetry(url: string, retries = 3): Promise<any> {
-  for (let i = 0; i < retries; i++) {
+async function fetchWithRetry(url, retries = 3, backoffMs = 500) {
+  let attempt = 0;
+  while (true) {
     try {
-      verbose(`Fetching ${url} (attempt ${i + 1}/${retries})`)
-      const response = await fetch(url)
-      if (!response.ok) throw new Error(`HTTP ${response.status}: ${response.statusText}`)
-      return await response.json()
-    } catch (error) {
-      if (i === retries - 1) throw error
-      const delay = Math.pow(2, i) * 1000
-      verbose(`Retry in ${delay}ms...`)
-      await new Promise((resolve) => setTimeout(resolve, delay))
+      verbose(`Fetching ${url} (attempt ${attempt + 1})`);
+      const res = await fetch(url);
+      if (!res.ok) throw new Error(`HTTP ${res.status} ${res.statusText}`);
+      return await res.text();
+    } catch (err) {
+      attempt++;
+      if (attempt >= retries) throw err;
+      const waitMs = backoffMs * Math.pow(2, attempt-1);
+      verbose(`Retrying in ${waitMs}ms`, err);
+      await wait(waitMs);
     }
   }
 }
 
-async function fetchWithCache(url: string, cachePath: string): Promise<any> {
-  // Try cache first
-  if (!FORCE) {
-    try {
-      await access(cachePath)
-      verbose(`Using cached data from ${cachePath}`)
-      const cached = await readFile(cachePath, "utf-8")
-      return JSON.parse(cached)
-    } catch {
-      verbose("No cache found, fetching fresh data")
-    }
-  }
+function normalizeId(uniqueName) {
+  return String(uniqueName).toUpperCase().trim();
+}
 
-  // Fetch fresh data
-  const data = await fetchWithRetry(url)
+function detectTier(uniqueName) {
+  const m = String(uniqueName).match(/T([0-9])(_|$)/i);
+  if (m) return Number(m[1]);
+  return undefined;
+}
 
-  // Save to cache
+function extractName(raw) {
+  return (
+    (raw.localizedNames && raw.localizedNames.en) ||
+    raw.displayName ||
+    raw.name ||
+    raw.uniqueName ||
+    ""
+  );
+}
+
+function unifyInputId(candidate) {
+  return normalizeId(String(candidate));
+}
+
+async function backupIfExists(targetPath) {
   try {
-    await mkdir(dirname(cachePath), { recursive: true })
-    await writeFile(cachePath, JSON.stringify(data, null, 2), "utf-8")
-    verbose(`Cached data to ${cachePath}`)
-  } catch (error) {
-    log(`Failed to cache data: ${error}`, "warn")
+    await fs.access(targetPath);
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const base = path.basename(targetPath);
+    const dest = path.join(BACKUPS_DIR, `${base}.bak-${ts}`);
+    await fs.copyFile(targetPath, dest);
+    log(`Backed up: ${dest}`);
+  } catch (e) {
+    // ignore if file does not exist
+  }
+}
+
+async function safeWrite(filePath, data) {
+  const tmp = `${filePath}.tmp`;
+  await fs.writeFile(tmp, JSON.stringify(data, null, 2), "utf8");
+  await fs.rename(tmp, filePath);
+}
+
+async function loadCache(filename) {
+  try {
+    return await fs.readFile(filename, "utf8");
+  } catch {
+    return null;
+  }
+}
+
+async function saveCache(filename, text) {
+  try {
+    await fs.writeFile(filename, text, "utf8");
+  } catch {
+    // ignore
+  }
+}
+
+async function build(opts) {
+  global.__BUILD_DB_VERBOSE = !!opts.verbose;
+  global.__BUILD_DB_SILENT = false;
+
+  await ensureDirs();
+
+  // 1: Fetch AO dump
+  let aoText = null;
+  if (!opts.force) {
+    aoText = await loadCache(CACHE_AO);
+    if (aoText) verbose("Loaded AO dump from cache");
+  }
+  if (!aoText) {
+    try {
+      log("Downloading AO bin-dump...");
+      aoText = await fetchWithRetry(AO_DUMP_URL, 4, 800);
+      await saveCache(CACHE_AO, aoText);
+    } catch (err) {
+      verbose("AO dump fetch failed:", err);
+    }
   }
 
-  return data
-}
-
-// Parse item category from UniqueName
-function categorizeItem(uniqueName: string): string {
-  const upper = uniqueName.toUpperCase()
-
-  // Weapons
-  if (upper.includes("_2H_") || upper.includes("_MAIN_")) return "weapon"
-  if (upper.includes("_SWORD") || upper.includes("_BOW") || upper.includes("_CROSSBOW")) return "weapon"
-  if (upper.includes("_AXE") || upper.includes("_HAMMER") || upper.includes("_MACE")) return "weapon"
-  if (upper.includes("_SPEAR") || upper.includes("_STAFF") || upper.includes("_QUARTERSTAFF")) return "weapon"
-  if (upper.includes("_CURSESTAFF") || upper.includes("_FIRESTAFF") || upper.includes("_FROSTSTAFF")) return "weapon"
-  if (upper.includes("_ARCANESTAFF") || upper.includes("_HOLYSTAFF") || upper.includes("_NATURESTAFF")) return "weapon"
-
-  // Armor
-  if (upper.includes("_HEAD_") || upper.includes("_ARMOR_") || upper.includes("_SHOES_")) return "armor"
-  if (upper.includes("_CAPE") || upper.includes("_BAG")) return "armor"
-
-  // Resources
-  if (upper.includes("_ORE") || upper.includes("_HIDE") || upper.includes("_WOOD")) return "resource"
-  if (upper.includes("_FIBER") || upper.includes("_ROCK") || upper.includes("_LEATHER")) return "resource"
-  if (upper.includes("_PLANKS") || upper.includes("_METALBAR") || upper.includes("_CLOTH")) return "resource"
-
-  // Consumables
-  if (upper.includes("_MEAL_") || upper.includes("_POTION_")) return "consumable"
-
-  return "other"
-}
-
-// Generate readable name from UniqueName
-function generateName(item: AOItem): string {
-  // Try localized name first
-  if (item.LocalizedNames?.["EN-US"]) {
-    return item.LocalizedNames["EN-US"]
+  // 2: Fetch AODP items
+  let aodpText = null;
+  if (!opts.force) {
+    aodpText = await loadCache(CACHE_AODP);
+    if (aodpText) verbose("Loaded AODP items from cache");
+  }
+  if (!aodpText) {
+    try {
+      log("Fetching AODP items...");
+      aodpText = await fetchWithRetry(AODP_ITEMS_URL, 3, 500);
+      await saveCache(CACHE_AODP, aodpText);
+    } catch (err) {
+      verbose("AODP fetch failed:", err);
+    }
   }
 
-  // Generate from UniqueName
-  const name = item.UniqueName.replace(/^T\d+_/, "") // Remove tier prefix
-    .replace(/@\d+$/, "") // Remove enchantment suffix
-    .replace(/_/g, " ")
-    .split(" ")
-    .map((word) => word.charAt(0) + word.slice(1).toLowerCase())
-    .join(" ")
+  if (!aoText && !aodpText) {
+    throw new Error("Could not fetch AO dump or AODP items");
+  }
 
-  return name
-}
+  let rawAoItems = [];
+  if (aoText) {
+    try {
+      const parsed = JSON.parse(aoText);
+      if (Array.isArray(parsed)) rawAoItems = parsed;
+      else if (parsed.items && Array.isArray(parsed.items)) rawAoItems = parsed.items;
+      else rawAoItems = Object.values(parsed);
+      verbose(`AO items parsed: ${rawAoItems.length}`);
+    } catch (err) {
+      verbose("Error parsing AO json:", err);
+    }
+  }
 
-// Extract tier from UniqueName
-function extractTier(uniqueName: string): number {
-  const match = uniqueName.match(/^T(\d+)_/)
-  return match ? Number.parseInt(match[1]) : 1
-}
+  let rawAodpItems = [];
+  if (aodpText) {
+    try {
+      const parsed = JSON.parse(aodpText);
+      if (Array.isArray(parsed)) rawAodpItems = parsed;
+      else rawAodpItems = [];
+      verbose(`AODP items parsed: ${rawAodpItems.length}`);
+    } catch (err) {
+      verbose("Error parsing AODP json:", err);
+    }
+  }
 
-// Extract enchantment from UniqueName
-function extractEnchantment(uniqueName: string): number {
-  const match = uniqueName.match(/@(\d+)$/)
-  return match ? Number.parseInt(match[1]) : 0
-}
+  // Build item map
+  const idToItem = new Map();
+  const recipes = [];
 
-// Process items from AO data
-function processItems(rawItems: AOItem[], stats: BuildStats): ProcessedItem[] {
-  const items: ProcessedItem[] = []
-  const seenIds = new Set<string>()
+  const aodpMap = new Map();
+  for (const ai of rawAodpItems) {
+    if (ai.item_id) {
+      aodpMap.set(normalizeId(ai.item_id), ai);
+    }
+  }
 
-  verbose(`Processing ${rawItems.length} raw items...`)
+  for (const raw of rawAoItems) {
+    const rawId = raw.uniqueName ?? raw.UniqueName ?? raw.name ?? raw.itemId ?? null;
+    if (!rawId) continue;
+    const id = normalizeId(rawId);
 
-  for (const item of rawItems) {
-    if (!item.UniqueName) continue
+    const name = extractName(raw) || (aodpMap.get(id) && aodpMap.get(id).name) || id;
+    const tier = detectTier(id);
+    const enchantment = typeof raw.enchantment === "number" ? raw.enchantment : 0;
+    const craftable = !!(raw.craftingRequirements || raw.crafting || raw.requirements);
 
-    // Skip duplicates
-    if (seenIds.has(item.UniqueName)) continue
-    seenIds.add(item.UniqueName)
-
-    const tier = item.Tier || extractTier(item.UniqueName)
-
-    // Filter: only include T2-T8 items
-    if (tier < 2 || tier > 8) continue
-
-    const processed: ProcessedItem = {
-      id: item.UniqueName,
-      name: generateName(item),
+    const item = {
+      id,
+      name,
       tier,
-      enchantment: item.enchantmentlevel || extractEnchantment(item.UniqueName),
-      category: categorizeItem(item.UniqueName),
-      craftable: !!item.craftingrequirements?.craftresource,
-    }
+      enchantment,
+      type: raw.itemType ?? raw.type,
+      category: raw.itemCategory ?? raw.category,
+      craftable,
+      aliases: [name],
+      description: raw.description
+    };
 
-    items.push(processed)
-    stats.totalItems++
-    if (processed.craftable) stats.craftableItems++
-  }
+    idToItem.set(id, item);
 
-  verbose(`Processed ${items.length} items (${stats.craftableItems} craftable)`)
-  return items
-}
-
-// Process recipes from AO data
-function processRecipes(
-  rawItems: AOItem[],
-  itemsMap: Map<string, ProcessedItem>,
-  stats: BuildStats,
-): ProcessedRecipe[] {
-  const recipes: ProcessedRecipe[] = []
-  const unresolvedRefs = new Map<string, number>()
-
-  verbose(`Processing recipes...`)
-
-  for (const item of rawItems) {
-    if (!item.UniqueName || !item.craftingrequirements?.craftresource) continue
-
-    const materials: Array<{ item_id: string; quantity: number }> = []
-    let hasUnresolved = false
-
-    for (const resource of item.craftingrequirements.craftresource) {
-      if (!resource.uniquename) continue
-
-      let itemId = resource.uniquename
-      const quantity = typeof resource.count === "string" ? Number.parseInt(resource.count) : resource.count || 1
-
-      // Validate material exists
-      if (!itemsMap.has(itemId)) {
-        // Try case-insensitive match
-        const normalized = Array.from(itemsMap.keys()).find((key) => key.toUpperCase() === itemId.toUpperCase())
-
-        if (normalized) {
-          itemId = normalized
-        } else {
-          // Log unresolved reference
-          unresolvedRefs.set(itemId, (unresolvedRefs.get(itemId) || 0) + 1)
-          hasUnresolved = true
-          if (VERBOSE) {
-            stats.warnings.push(`Recipe ${item.UniqueName}: material ${itemId} not found`)
-          }
-          continue // Skip this material but continue with recipe
-        }
+    const craft = raw.craftingRequirements ?? raw.crafting ?? raw.requirements ?? null;
+    if (craft) {
+      const inputs = [];
+      const def = craft.craftResource ?? craft.resources ?? craft.requirements ?? craft.ingredients ?? [];
+      for (const r of def) {
+        const cand = r.uniqueName ?? r.UniqueName ?? r.item ?? r.name;
+        const qty = r.count ?? r.Count ?? r.quantity ?? 1;
+        if (!cand) continue;
+        inputs.push({ item_id: unifyInputId(cand), quantity: Number(qty) });
       }
-
-      materials.push({ item_id: itemId, quantity })
-    }
-
-    // Only add recipe if it has at least one valid material
-    if (materials.length > 0) {
-      const returnRate = item.craftingrequirements.returnamountfactor
-        ? Number.parseFloat(String(item.craftingrequirements.returnamountfactor))
-        : 0.152 // Default 15.2% return rate
+      const outputCount = Number(craft.outputCount ?? craft.output_count ?? craft.output ?? 1);
+      const baseReturnRate = craft.baseReturnRate ?? craft.base_return_rate ?? craft.returnRate;
+      const station = craft.stationType ?? craft.craftingStation;
+      const silverCost = craft.silverCost ?? craft.silver_cost;
 
       recipes.push({
-        item_id: item.UniqueName,
-        materials,
-        base_return_rate: returnRate,
-        silver_cost: item.craftingrequirements.silver
-          ? Number.parseInt(String(item.craftingrequirements.silver))
-          : undefined,
-      })
-
-      stats.recipesGenerated++
-    } else if (hasUnresolved) {
-      stats.warnings.push(`Recipe ${item.UniqueName}: all materials unresolved, skipping`)
+        id,
+        inputs,
+        output_count: outputCount,
+        base_return_rate: typeof baseReturnRate === "number" ? Number(baseReturnRate) : undefined,
+        crafting_station: station,
+        silver_cost: typeof silverCost === "number" ? Number(silverCost) : undefined,
+        notes: "Generated from AO dump"
+      });
     }
   }
 
-  // Log unresolved summary
-  if (unresolvedRefs.size > 0) {
-    log(`Found ${unresolvedRefs.size} unresolved material references`, "warn")
-    if (VERBOSE) {
-      const sorted = Array.from(unresolvedRefs.entries())
-        .sort((a, b) => b[1] - a[1])
-        .slice(0, 10)
-      sorted.forEach(([id, count]) => {
-        log(`  ${id}: referenced ${count} times`, "warn")
-      })
+  // Validate recipe inputs
+  const known = new Set(idToItem.keys());
+  const unresolved = new Set();
+  const warnings = [];
+
+  for (const rec of recipes) {
+    const missing = [];
+    for (const inp of rec.inputs) {
+      if (!known.has(inp.item_id)) {
+        const attempts = [
+          inp.item_id.toUpperCase(),
+          inp.item_id.replace(/\./g, "_").toUpperCase(),
+          inp.item_id.replace(/@/g, "_").toUpperCase(),
+        ];
+        let found = false;
+        for (const a of attempts) {
+          if (known.has(a)) {
+            inp.item_id = a;
+            found = true;
+            break;
+          }
+        }
+        if (!found) {
+          missing.push(inp.item_id);
+          unresolved.add(inp.item_id);
+        }
+      }
     }
+    if (missing.length) warnings.push({ recipeId: rec.id, missing });
   }
 
-  verbose(`Processed ${recipes.length} recipes`)
-  return recipes
+  log(`Parsed items: ${idToItem.size}`);
+  log(`Parsed recipes: ${recipes.length}`);
+  log(`Unresolved inputs: ${unresolved.size}`);
+
+  // Prepare output arrays
+  const itemsArr = Array.from(idToItem.values());
+  let recipesArr = recipes;
+
+  if (opts.sample && Number(opts.sample) > 0) {
+    const n = Number(opts.sample);
+    itemsArr.splice(n);
+    recipesArr.splice(n);
+    log(`Sample mode: writing ${itemsArr.length} items and ${recipesArr.length} recipes`);
+  }
+
+  if (!opts.dryRun) {
+    await backupIfExists(path.join(LIB_DIR, "items-full.json"));
+    await backupIfExists(path.join(LIB_DIR, "recipes-full.json"));
+
+    await safeWrite(path.join(LIB_DIR, "items-full.json"), itemsArr);
+    await safeWrite(path.join(LIB_DIR, "recipes-full.json"), recipesArr);
+    log("Database written to lib/");
+  } else {
+    log("Dry-run: no files written.");
+  }
+
+  if (unresolved.size > 0) {
+    const ts = new Date().toISOString().replace(/[:.]/g, "-");
+    const warnPath = path.join(BACKUPS_DIR, `build-warnings-${ts}.json`);
+    await fs.writeFile(
+      warnPath,
+      JSON.stringify({ unresolved: Array.from(unresolved), warnings }, null, 2),
+      "utf8"
+    );
+    log(`Warnings written to ${warnPath}`);
+  }
+
+  return { items: itemsArr.length, recipes: recipesArr.length, warnings: unresolved.size };
 }
 
-// Main build function
-async function build() {
-  log("Starting Albion Online database build...")
-  const startTime = Date.now()
-
-  const stats: BuildStats = {
-    totalItems: 0,
-    craftableItems: 0,
-    recipesGenerated: 0,
-    warnings: [],
+async function main() {
+  const argv = process.argv.slice(2);
+  const opts = { force: false, dryRun: false, verbose: false, sample: null };
+  for (let i = 0; i < argv.length; i++) {
+    if (argv[i] === "--force") opts.force = true;
+    if (argv[i] === "--dry-run") opts.dryRun = true;
+    if (argv[i] === "--verbose") opts.verbose = true;
+    if (argv[i] === "--sample" && argv[i + 1]) {
+      opts.sample = Number(argv[i + 1]);
+      i++;
+    }
   }
-
   try {
-    // Fetch data
-    log("Fetching AO data dump...")
-    const rawData = await fetchWithCache(AO_DATA_URL, CACHE_PATH)
-
-    if (!Array.isArray(rawData)) {
-      throw new Error("Invalid data format: expected array")
-    }
-
-    // Apply sample filter if requested
-    const dataToProcess = SAMPLE_SIZE ? rawData.slice(0, SAMPLE_SIZE) : rawData
-    if (SAMPLE_SIZE) {
-      log(`Using sample of ${SAMPLE_SIZE} items`)
-    }
-
-    // Process items
-    log("Processing items...")
-    const items = processItems(dataToProcess, stats)
-    const itemsMap = new Map(items.map((item) => [item.id, item]))
-
-    // Process recipes
-    log("Processing recipes...")
-    const recipes = processRecipes(dataToProcess, itemsMap, stats)
-
-    // Validate
-    log("Validating data...")
-    const recipeItemIds = new Set(recipes.map((r) => r.item_id))
-    const orphanedRecipes = recipes.filter((r) => !itemsMap.has(r.item_id))
-    if (orphanedRecipes.length > 0) {
-      log(`Warning: ${orphanedRecipes.length} recipes for non-existent items`, "warn")
-    }
-
-    // Prepare output
-    const itemsOutput = items.sort((a, b) => a.id.localeCompare(b.id))
-    const recipesOutput = recipes.sort((a, b) => a.item_id.localeCompare(b.item_id))
-
-    if (DRY_RUN) {
-      log("DRY RUN: Skipping file writes")
-    } else {
-      // Create backup directory
-      await mkdir(BACKUP_DIR, { recursive: true })
-
-      // Backup existing files
-      const timestamp = new Date().toISOString().replace(/[:.]/g, "-").slice(0, -5)
-      try {
-        await access(ITEMS_OUTPUT)
-        const backupPath = join(BACKUP_DIR, `items-full-${timestamp}.json`)
-        await copyFile(ITEMS_OUTPUT, backupPath)
-        verbose(`Backed up items to ${backupPath}`)
-      } catch {
-        // No existing file to backup
-      }
-
-      try {
-        await access(RECIPES_OUTPUT)
-        const backupPath = join(BACKUP_DIR, `recipes-full-${timestamp}.json`)
-        await copyFile(RECIPES_OUTPUT, backupPath)
-        verbose(`Backed up recipes to ${backupPath}`)
-      } catch {
-        // No existing file to backup
-      }
-
-      // Write outputs
-      log("Writing output files...")
-      await mkdir(OUTPUT_DIR, { recursive: true })
-      await writeFile(ITEMS_OUTPUT, JSON.stringify(itemsOutput, null, 2), "utf-8")
-      await writeFile(RECIPES_OUTPUT, JSON.stringify(recipesOutput, null, 2), "utf-8")
-
-      log(`✓ Wrote ${ITEMS_OUTPUT}`)
-      log(`✓ Wrote ${RECIPES_OUTPUT}`)
-
-      // Write warnings file if needed
-      if (stats.warnings.length > 0) {
-        const warningsPath = join(BACKUP_DIR, `build-warnings-${timestamp}.json`)
-        await writeFile(warningsPath, JSON.stringify(stats.warnings, null, 2), "utf-8")
-        log(`⚠️ Wrote warnings to ${warningsPath}`, "warn")
-      }
-    }
-
-    // Summary
-    const duration = ((Date.now() - startTime) / 1000).toFixed(2)
-    log("\n═══════════════════════════════════════")
-    log("Build Summary:")
-    log(`  Total items: ${stats.totalItems}`)
-    log(`  Craftable items: ${stats.craftableItems}`)
-    log(`  Recipes generated: ${stats.recipesGenerated}`)
-    log(`  Warnings: ${stats.warnings.length}`)
-    log(`  Duration: ${duration}s`)
-    log("═══════════════════════════════════════\n")
-
-    if (stats.warnings.length > 0) {
-      log(`Run with --verbose to see detailed warnings`, "warn")
-    }
-
-    log("Database build completed successfully!")
-  } catch (error) {
-    log(`Build failed: ${error}`, "error")
-    process.exit(1)
+    log("Starting build-database...");
+    const result = await build(opts);
+    log("Finished:", result);
+  } catch (err) {
+    console.error("Error:", err);
+    process.exit(1);
   }
 }
 
-// Run
-build()
+if (import.meta.url === `file://${process.argv[1]}`) {
+  main();
+}
